@@ -422,11 +422,10 @@ def get_print_function(save_print_log, log_filename):
         return print
 
 def _create_onnxruntime_session(onnx_model_path):
-    import os
-    import psutil
-    os.environ["OMP_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
-    os.environ["OMP_WAIT_POLICY"] = 'ACTIVE'
-
+    #import os
+    #import psutil
+    #os.environ["OMP_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+    #os.environ["OMP_WAIT_POLICY"] = 'ACTIVE'
     import onnxruntime
     sess_options = onnxruntime.SessionOptions()
     sess_options.intra_op_num_threads = 1
@@ -460,8 +459,13 @@ def _compute_onnxruntime(
     for c, model_name in enumerate(model_names):
         print_fn(f"{c + 1} / {len(model_names)}")
 
-        model = model_name + ("_fp16" if fp16 else "") + ".onnx"
-
+        # Try use optimized model.
+        opt_model = model_name + ("_fp16" if fp16 else "_fp32") + ".onnx"
+        if os.path.exists(opt_model):
+            model = opt_model
+        else:
+            model = model_name + ".onnx"
+        
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         max_input_size = tokenizer.max_model_input_sizes[model_name]
