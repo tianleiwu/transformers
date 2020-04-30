@@ -13,10 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Benchmarking the library on inference and training """
-
-# If checking the tensors placement
-# tf.debugging.set_log_device_placement(True)
+""" Benchmarking the inference of transformer models """
 
 import argparse
 import csv
@@ -24,6 +21,7 @@ import logging
 import timeit
 from time import time
 from typing import Callable, List
+import numpy
 
 from transformers import (
     AutoConfig,
@@ -34,7 +32,6 @@ from transformers import (
     start_memory_tracing,
     stop_memory_tracing,
 )
-
 
 if is_tf_available():
     import tensorflow as tf
@@ -260,7 +257,7 @@ def create_setup_and_compute(
     batch_sizes: List[int],
     slice_sizes: List[int],
     gpu: bool = True,
-    tensorflow: bool = False,
+    runtime: str = 'PyTorch',
     average_over: int = 3,
     no_speed: bool = False,
     no_memory: bool = False,
@@ -279,7 +276,7 @@ def create_setup_and_compute(
     if amp:
         tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
 
-    if tensorflow:
+    if runtime == 'tensorflow':
         dictionary = {model_name: {} for model_name in model_names}
         results = _compute_tensorflow(
             model_names,
@@ -293,7 +290,7 @@ def create_setup_and_compute(
             verbose,
             print_fn,
         )
-    else:
+    elif runtime == 'pytorch':
         device = "cuda" if (gpu and torch.cuda.is_available()) else "cpu"
         dictionary = {model_name: {} for model_name in model_names}
         results = _compute_pytorch(
@@ -304,6 +301,20 @@ def create_setup_and_compute(
             average_over,
             device,
             torchscript,
+            fp16,
+            no_speed,
+            no_memory,
+            verbose,
+            print_fn,
+        )
+    else: # runtime == 'onnxruntime'
+        dictionary = {model_name: {} for model_name in model_names}
+        results = _compute_onnxruntime(
+            model_names,
+            batch_sizes,
+            slice_sizes,
+            dictionary,
+            average_over,
             fp16,
             no_speed,
             no_memory,
@@ -410,6 +421,91 @@ def get_print_function(save_print_log, log_filename):
     else:
         return print
 
+def _create_onnxruntime_session(onnx_model_path):
+    import os
+    import psutil
+    os.environ["OMP_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+    os.environ["OMP_WAIT_POLICY"] = 'ACTIVE'
+
+    import onnxruntime
+    sess_options = onnxruntime.SessionOptions()
+    sess_options.intra_op_num_threads = 1
+    session = onnxruntime.InferenceSession(onnx_model_path, sess_options)
+    return session
+
+def get_onnxruntime_input(model_name, tokenizer, batch_size, sequence_length):
+    tokenized_sequence = tokenizer.encode(input_text, add_special_tokens=False)
+    sequence = torch.tensor(tokenized_sequence[:sequence_length], device="cpu").repeat(batch_size, 1)
+    ort_inputs = {'input_ids': sequence.numpy()}
+    if "gpt2" not in model_name:
+        ort_inputs['attention_mask'] = numpy.ones([batch_size, sequence_length], dtype = int64)
+        ort_inputs['token_type_ids'] = numpy.zeros([batch_size, sequence_length], dtype = int64)
+    return ort_inputs
+
+def inference_onnxruntime(ort_session, ort_inputs):
+    return ort_session.run(None, ort_inputs)
+
+def _compute_onnxruntime(
+    model_names,
+    batch_sizes,
+    slice_sizes,
+    dictionary,
+    average_over,
+    fp16,
+    no_speed,
+    no_memory,
+    verbose,
+    print_fn,
+):
+    for c, model_name in enumerate(model_names):
+        print_fn(f"{c + 1} / {len(model_names)}")
+
+        model = model_name + ("_fp16" if fp16 else "") + ".onnx"
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        max_input_size = tokenizer.max_model_input_sizes[model_name]
+
+        dictionary[model_name] = {"bs": batch_sizes, "ss": slice_sizes, "time": {}, "memory": {}}
+        dictionary[model_name]["time"] = {i: {} for i in batch_sizes}
+        dictionary[model_name]["memory"] = {i: {} for i in batch_sizes}
+
+        print_fn("Using model {}".format(model))
+
+        for batch_size in batch_sizes:
+            for slice_size in slice_sizes:
+                if max_input_size is not None and slice_size > max_input_size:
+                    dictionary[model_name]["time"][batch_size][slice_size] = "N/A"
+                else:
+                    ort_session = _create_onnxruntime_session(model)
+                    ort_input = get_onnxruntime_input(model_name, tokenizer, batch_size, slice_size)
+                    try:
+                        if not no_memory:
+                            # Line by line memory tracing (all code in the module `transformers`) works for all models/arbitrary code
+                            trace = start_memory_tracing("onnxruntime")
+                            inference_onnxruntime(ort_session, ort_input)
+                            summary = stop_memory_tracing(trace)
+
+                            if verbose:
+                                print_summary_statistics(summary, print_fn)
+
+                            dictionary[model_name]["memory"][batch_size][slice_size] = str(summary.total)
+                        else:
+                            inference_onnx(model, sequence)
+                            dictionary[model_name]["memory"][batch_size][slice_size] = "N/A"
+
+                        if not no_speed:
+                            print_fn("Going through model with sequence of shape {}".format([batch_size, slice_size]))
+                            runtimes = timeit.repeat(lambda: inference_onnxruntime(ort_session, ort_input), repeat=average_over, number=3)
+                            average_time = sum(runtimes) / float(len(runtimes)) / 3.0
+                            dictionary[model_name]["time"][batch_size][slice_size] = average_time
+                        else:
+                            dictionary[model_name]["time"][batch_size][slice_size] = "N/A"
+                    except RuntimeError as e:
+                        print_fn("Runtime error: {}".format(e))
+                        dictionary[model_name]["time"][batch_size][slice_size] = "N/A"
+                        dictionary[model_name]["memory"][batch_size][slice_size] = "N/A"
+    return dictionary
 
 def _compute_pytorch(
     model_names,
@@ -478,7 +574,7 @@ def _compute_pytorch(
                             dictionary[model_name]["memory"][batch_size][slice_size] = "N/A"
 
                         if not no_speed:
-                            print_fn("Going through model with sequence of shape".format(sequence.shape))
+                            print_fn("Going through model with sequence of shape {}".format(sequence.shape))
                             runtimes = timeit.repeat(lambda: inference(sequence), repeat=average_over, number=3)
                             average_time = sum(runtimes) / float(len(runtimes)) / 3.0
                             dictionary[model_name]["time"][batch_size][slice_size] = average_time
@@ -575,6 +671,11 @@ def main():
     parser.add_argument("--verbose", required=False, action="store_true", help="Verbose memory tracing")
     parser.add_argument("--no_speed", required=False, action="store_true", help="Don't perform speed measurments")
     parser.add_argument("--no_memory", required=False, action="store_true", help="Don't perform memory measurments")
+
+    parser.add_argument(
+        "--onnxruntime", required=False, action="store_true", help="Benchmark the Onnx version of the " "models"
+    )
+
     parser.add_argument(
         "--torch", required=False, action="store_true", help="Benchmark the Pytorch version of the " "models"
     )
@@ -645,16 +746,16 @@ def main():
         args.models = [
             "gpt2",
             "bert-base-cased",
-            "xlnet-base-cased",
-            "xlm-mlm-en-2048",
-            "transfo-xl-wt103",
-            "openai-gpt",
+            #"xlnet-base-cased",
+            #"xlm-mlm-en-2048",
+            #"transfo-xl-wt103",
+            #"openai-gpt",
             "distilbert-base-uncased",
             "distilgpt2",
             "roberta-base",
-            "ctrl",
-            "t5-base",
-            "bart-large",
+            #"ctrl",
+            #"t5-base",
+            #"bart-large",
         ]
     else:
         args.models = args.models.split()
@@ -662,13 +763,32 @@ def main():
     print_fn = get_print_function(args.log_print, args.log_filename)
     print_fn("Running with arguments: {}".format(args))
 
+    if args.onnxruntime:
+        create_setup_and_compute(
+            model_names=args.models,
+            batch_sizes=args.batch_sizes,
+            slice_sizes=args.slice_sizes,
+            runtime = 'onnxruntime',
+            gpu=args.torch_cuda,
+            torchscript=args.torchscript,
+            fp16=args.fp16,
+            save_to_csv=args.save_to_csv,
+            csv_time_filename=args.csv_time_filename,
+            csv_memory_filename=args.csv_memory_filename,
+            average_over=args.average_over,
+            no_speed=args.no_speed,
+            no_memory=args.no_memory,
+            verbose=args.verbose,
+            print_fn=print_fn,
+        )
+
     if args.torch:
         if is_torch_available():
             create_setup_and_compute(
                 model_names=args.models,
                 batch_sizes=args.batch_sizes,
                 slice_sizes=args.slice_sizes,
-                tensorflow=False,
+                runtime = 'pytorch',
                 gpu=args.torch_cuda,
                 torchscript=args.torchscript,
                 fp16=args.fp16,
@@ -690,7 +810,7 @@ def main():
                 model_names=args.models,
                 batch_sizes=args.batch_sizes,
                 slice_sizes=args.slice_sizes,
-                tensorflow=True,
+                runtime = 'tensorflow',
                 xla=args.xla,
                 amp=args.amp,
                 save_to_csv=args.save_to_csv,
